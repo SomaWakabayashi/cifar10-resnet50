@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Environment
+.env
+
+# OS Files (Windows/Mac)
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Data & Models (Gitに上げない)
+data/
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# IDE settings
+.vscode/
+.idea/
