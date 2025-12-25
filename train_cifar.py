@@ -33,7 +33,6 @@ def get_transforms(augment_mode='standard'):
             transforms.Normalize(mean, std),
         ])
     elif augment_mode == 'randaug':
-        # Week 3 追加: RandAugment
         transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
@@ -42,7 +41,7 @@ def get_transforms(augment_mode='standard'):
             transforms.Normalize(mean, std),
         ])
     else:
-        # standard, mixup, cutmix
+        # standard
         transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
@@ -56,46 +55,59 @@ def get_data_loaders(batch_size, augment_mode='standard', num_workers=2):
     transform_train, transform_test = get_transforms(augment_mode)
     train_set = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
     test_set = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     return train_loader, test_loader, train_set.classes
 
 def get_model(num_classes=10):
+    # 標準のResNet50をロード
     model = torchvision.models.resnet50(weights=None)
+    
+    # --- CIFAR-10 向けの最適化 ---
+    # 1. 最初の畳み込み層を 7x7 stride=2 から 3x3 stride=1 に変更
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    # 2. 最初の MaxPool (画像をさらに1/2にする) を無効化
+    model.maxpool = nn.Identity()
+    
+    # 最終層の付け替え
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
-def train_one_epoch(model, loader, criterion, optimizer, device, augment_method='standard'):
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler, augment_method='standard'):
     model.train()
     running_loss, correct, total = 0.0, 0, 0
     pbar = tqdm(loader, desc="Training", leave=False)
+    
     for images, labels in pbar:
-        images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
+        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
 
-        if augment_method == 'mixup':
-            images, targets_a, targets_b, lam = mixup_data(images, labels, alpha=1.0, device=device)
-            outputs = model(images)
-            loss = mix_criterion(criterion, outputs, targets_a, targets_b, lam)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += (lam * predicted.eq(targets_a).sum().float() + (1 - lam) * predicted.eq(targets_b).sum().float()).item()
-        elif augment_method == 'cutmix':
-            images, targets_a, targets_b, lam = cutmix_data(images, labels, beta=1.0, device=device)
-            outputs = model(images)
-            loss = mix_criterion(criterion, outputs, targets_a, targets_b, lam)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += (lam * predicted.eq(targets_a).sum().float() + (1 - lam) * predicted.eq(targets_b).sum().float()).item()
-        else:
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+        with torch.cuda.amp.autocast():
+            if augment_method == 'mixup':
+                images, targets_a, targets_b, lam = mixup_data(images, labels, alpha=1.0, device=device)
+                outputs = model(images)
+                loss = mix_criterion(criterion, outputs, targets_a, targets_b, lam)
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += (lam * predicted.eq(targets_a).sum().float() + (1 - lam) * predicted.eq(targets_b).sum().float()).item()
+            elif augment_method == 'cutmix':
+                images, targets_a, targets_b, lam = cutmix_data(images, labels, beta=1.0, device=device)
+                outputs = model(images)
+                loss = mix_criterion(criterion, outputs, targets_a, targets_b, lam)
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += (lam * predicted.eq(targets_a).sum().float() + (1 - lam) * predicted.eq(targets_b).sum().float()).item()
+            else:
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
 
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         running_loss += loss.item()
     return running_loss / len(loader), 100. * correct / total
 
@@ -104,9 +116,10 @@ def evaluate(model, loader, criterion, device):
     running_loss, all_preds, all_labels = 0.0, [], []
     with torch.no_grad():
         for images, labels in tqdm(loader, desc="Evaluating", leave=False):
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            with torch.cuda.amp.autocast():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
             running_loss += loss.item()
             _, predicted = outputs.max(1)
             all_preds.extend(predicted.cpu().numpy())
@@ -119,9 +132,10 @@ def save_misclassified_samples(model, loader, device, classes, save_dir, num_sam
     with torch.no_grad():
         for images, labels in loader:
             images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
+            with torch.cuda.amp.autocast():
+                outputs = model(images)
             _, predicted = outputs.max(1)
-            mask = predicted != labels
+            mask = (predicted != labels)
             if mask.any():
                 imgs, lbls, preds = images[mask].cpu(), labels[mask].cpu(), predicted[mask].cpu()
                 for i in range(len(imgs)):
@@ -141,27 +155,11 @@ def save_misclassified_samples(model, loader, device, classes, save_dir, num_sam
     plt.savefig(os.path.join(save_dir, 'misclassified_samples.png'))
     plt.close()
 
-def save_plots(history, save_dir):
-    for metric in ['loss', 'acc']:
-        plt.figure(figsize=(10, 5))
-        plt.plot(history[f'train_{metric}'], label=f'Train {metric.capitalize()}')
-        plt.plot(history[f'val_{metric}'], label=f'Val {metric.capitalize()}')
-        plt.title(f'{metric.capitalize()} Curve')
-        plt.legend(); plt.grid(); plt.savefig(os.path.join(save_dir, f'{metric}_curve.png')); plt.close()
-
-def save_confusion_matrix(all_labels, all_preds, classes, save_dir):
-    cm = confusion_matrix(all_labels, all_preds)
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes)
-    plt.xlabel('Predicted'); plt.ylabel('True'); plt.title('Confusion Matrix')
-    plt.savefig(os.path.join(save_dir, 'confusion_matrix.png')); plt.close()
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_name', type=str, required=True)
     parser.add_argument('--augment', type=str, default='standard', choices=['simple', 'standard', 'mixup', 'cutmix', 'randaug'])
     parser.add_argument('--label_smoothing', type=float, default=0.1)
-    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--epochs', type=int, default=40)
     parser.add_argument('--lr', type=float, default=0.1)
     parser.add_argument('--weight_decay', type=float, default=1e-3)
@@ -174,15 +172,21 @@ def main():
     save_dir = os.path.join('runs', args.exp_name)
     os.makedirs(save_dir, exist_ok=True)
 
-    train_loader, test_loader, classes = get_data_loaders(args.batch_size, augment_mode=args.augment)
+    train_loader, test_loader, classes = get_data_loaders(128, augment_mode=args.augment)
     model = get_model().to(device)
+    
+    # PyTorch 2.0+ コンパイル
+    if hasattr(torch, 'compile'):
+        model = torch.compile(model)
+
     criterion = LabelSmoothingLoss(classes=len(classes), smoothing=args.label_smoothing) if args.label_smoothing > 0 else nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = torch.cuda.amp.GradScaler()
 
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
     for epoch in range(args.epochs):
-        t_loss, t_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, args.augment)
+        t_loss, t_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler, args.augment)
         v_loss, v_preds, v_labels = evaluate(model, test_loader, criterion, device)
         v_acc = 100. * sum(np.array(v_preds) == np.array(v_labels)) / len(v_labels)
         scheduler.step()
@@ -191,10 +195,18 @@ def main():
 
     torch.save(model.state_dict(), os.path.join(save_dir, 'model.pth'))
     pd.DataFrame(history).to_csv(os.path.join(save_dir, 'history.csv'), index=False)
-    save_plots(history, save_dir)
-    save_confusion_matrix(v_labels, v_preds, classes, save_dir)
+    
+    # グラフ等の保存
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['train_acc'], label='Train Acc'); plt.plot(history['val_acc'], label='Val Acc')
+    plt.legend(); plt.savefig(os.path.join(save_dir, 'acc_curve.png')); plt.close()
+    
+    cm = confusion_matrix(v_labels, v_preds)
+    plt.figure(figsize=(10, 8)); sns.heatmap(cm, annot=True, fmt='d', xticklabels=classes, yticklabels=classes)
+    plt.savefig(os.path.join(save_dir, 'confusion_matrix.png')); plt.close()
+    
     save_misclassified_samples(model, test_loader, device, classes, save_dir)
-    print(f"✅ Saved to {save_dir}")
+    print(f"✅ Training Complete. Saved to {save_dir}")
 
 if __name__ == '__main__':
     main()
